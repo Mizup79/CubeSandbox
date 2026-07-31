@@ -30,6 +30,7 @@ sudo tail -F /data/log/Cubelet/Cubelet-req.log
 sudo tail -F /data/log/CubeMaster/cubemaster-req.log
 sudo tail -F /data/log/CubeAPI/cube-api-$(date +%F).log
 sudo tail -F /data/log/CubeVmm/vmm.log              # 沙箱 VMM 创建过程
+sudo tail -F /data/log/cube-proxy/error.log         # 代理错误
 
 # 4. 看启动失败 / 进程异常退出 → journalctl
 sudo journalctl -u cube-sandbox-cube-api.service -n 200 --no-pager
@@ -68,7 +69,7 @@ Target 通过 `Wants=` 列出自己要拉起的 service；service 通过 `PartOf
 | `cube-sandbox-network-agent.service` | 宿主机进程 | `19090`（health） | control / compute | network |
 | `cube-sandbox-cubelet.service` | 宿主机进程 | `9999`（gRPC） | control / compute | network-agent + `/data/cubelet`（XFS） |
 | `cube-sandbox-coredns.service` | Docker 容器 | `127.0.0.54:53` 或 `169.254.254.53:53` | control | docker |
-| `cube-sandbox-cube-proxy.service` | Docker 容器 | `443`（TLS）/ `80` | control | docker, redis |
+| `cube-sandbox-cube-proxy.service` | Docker 容器 | `443`（TLS）/ `80` / `9090`（gRPC） | control | docker, redis |
 | `cube-sandbox-dns.service` | oneshot（无常驻进程） | — | control | coredns（`BindsTo`）|
 | `cube-sandbox-webui.service` | Docker 容器 | `12088` | control | docker, cube-api |
 
@@ -217,13 +218,12 @@ sudo systemctl stop cube-sandbox-compute.target   # 计算节点
 
 ## 查看日志
 
-CubeSandbox 的日志分三类，**不要混淆**：
+CubeSandbox 有多种日志来源，其中也包括各组件自己的容器内日志。宿主机侧主要有以下两个入口：
 
 | 来源 | 包含什么 | 在哪里看 |
 |---|---|---|
 | **业务行为日志（推荐入口）** | 请求、调度决策、stat、audit、VMM 启动过程 | **`/data/log/<Module>/`** |
 | 启动期日志 | systemd 拉起 / hook / ExecStartPost / 退出码 / 容器 build 输出 | `journalctl -u <unit>` |
-| 容器内业务日志 | 仅 `cube-proxy`：访问/错误日志写在容器内部 | `docker exec cube-proxy tail /data/log/cube-proxy/error.log` |
 
 ### `/data/log/` 业务日志（重点）
 
@@ -237,7 +237,7 @@ CubeSandbox 的日志分三类，**不要混淆**：
 | network-agent | `/data/log/network-agent/` | `network-agent-req.log` |
 | CubeShim | `/data/log/CubeShim/` | `cube-shim-req.log`、`cube-shim-stat.log` |
 | Hypervisor (VMM) | `/data/log/CubeVmm/` | `vmm.log`（每次创建沙箱都会写 VMM 日志）|
-| cube-proxy | 容器内 `/data/log/cube-proxy/` | `error.log`、`access.log`（见下文）|
+| cube-proxy | `/data/log/cube-proxy/` | `error.log`、`access.log`（见下文）|
 
 常用命令：
 
@@ -276,16 +276,16 @@ sudo journalctl -u cube-sandbox-cube-api.service -b
 进程跑稳之后的 stdout/stderr 输出非常少，因为各组件都把业务日志直接写到 `/data/log/<Module>/`。如果你想看「最近一小时谁创建了沙箱」，**journalctl 是错的入口**，请去 `/data/log/CubeMaster/cubemaster-req.log` 或 `/data/log/Cubelet/Cubelet-req.log`。
 :::
 
-### cube-proxy 容器内日志
+### cube-proxy 宿主机日志
 
-`cube-proxy` 是基于 OpenResty 的 nginx 容器，访问/错误日志写在容器内的 `/data/log/cube-proxy/`，**不在宿主机文件系统上**，需要 `docker exec` 取：
+`cube-proxy` 是基于 OpenResty 的 nginx 容器。一键部署会将宿主机目录 `/data/log/cube-proxy/` bind mount 到容器内同一路径，容器重启后日志仍然保留，可以直接从宿主机读取：
 
 ```bash
-sudo docker exec cube-proxy tail -200 /data/log/cube-proxy/error.log
-sudo docker exec cube-proxy tail -200 /data/log/cube-proxy/access.log
+sudo tail -200 /data/log/cube-proxy/error.log
+sudo tail -200 /data/log/cube-proxy/access.log
 ```
 
-容器名固定为 `cube-proxy`（由 systemd 用 `docker create` 创建）。
+容器内仍使用同一个 `/data/log/cube-proxy/` 路径，不需要重新构建镜像。
 
 ### 一键打包诊断信息
 
@@ -298,7 +298,7 @@ sudo /usr/local/services/cubetoolbox/scripts/cube-diag/collect-logs.sh
 它会把以下内容统一收集到 `cube-diag-<时间戳>/` 目录下：
 
 - `/data/log/CubeMaster|Cubelet|CubeAPI|CubeShim|CubeVmm|network-agent/` 的 tail
-- `cube-proxy` 容器内 `error.log` / `access.log`
+- `/data/log/cube-proxy/` 下的 access/error 日志
 - `dmesg` / 进程列表 / 端口 / 挂载 / cgroup / cpuinfo 等环境快照
 - 主要配置文件（敏感信息已脱敏）
 
@@ -387,7 +387,7 @@ sudo journalctl -u cube-sandbox-<service>.service -n 200 --no-pager
 
 - 容器镜像构建依赖外网（如 `cube-proxy` 的 `apk update`）暂时不可达 → 检查网络，或参阅[部署相关排障](./troubleshooting/deployment.md)
 - `ExecStartPost` 健康端口超时（端口被占用 / 上游服务还没起来）
-- 对 `cube-sandbox-cube-proxy.service`，`CUBE_PROXY_HTTP_PORT` 是 nginx 实际 HTTP 代理监听端口，也是启动后 TCP 检查使用的端口。`CUBE_PROXY_HOST_PORT` 已废弃且会被忽略；如果需要改检查端口，请改 `CUBE_PROXY_HTTP_PORT`。
+- 对 `cube-sandbox-cube-proxy.service`，`CUBE_PROXY_HTTP_PORT` 与 `CUBE_PROXY_GRPC_PORT` 是 systemd 启动后 TCP 检查所关注的 nginx 监听端口。`CUBE_PROXY_HOST_PORT` 已废弃且会被忽略；如果需要改 HTTP 检查端口，请改 `CUBE_PROXY_HTTP_PORT`。
 - `/data/log` 或 `/data/cubelet` 目录不存在 / 权限不对 / XFS 挂载错位
 
 ### Dashboard / API 无法访问

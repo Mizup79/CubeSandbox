@@ -33,6 +33,12 @@ func SandboxInfo(ctx context.Context, req *types.GetCubeSandboxReq) (rsp *types.
 		},
 	}
 	log.G(ctx).Infof("GetSandboxInfo:%+v", utils.InterfaceToString(req))
+	if req.SandboxID != "" {
+		if ret := normalizeSandboxIDInReq(ctx, &req.SandboxID); ret != nil {
+			rsp.Ret = ret
+			return
+		}
+	}
 	defer func() {
 		if log.IsDebug() {
 			log.G(ctx).Debugf("GetSandboxInfo_rsp:%+v", utils.InterfaceToString(rsp))
@@ -173,6 +179,7 @@ func doget(ctx context.Context, calleep string, cubeletReq *cubebox.ListCubeSand
 		one.Annotations = buildAnnotationsFromLabels(sandboxLabels)
 		one.Labels = sandboxLabels
 		one.EndAt = LookupSandboxEndAt(ctx, sandbox.GetId())
+		one.VolumeMounts = volumeMountsToContainerInfo(collectVolumeMountsFromContainers(sandbox.GetContainers()))
 		rsp.Data = append(rsp.Data, one)
 	}
 	return nil

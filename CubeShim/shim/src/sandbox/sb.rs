@@ -2,7 +2,33 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::collections::{HashMap, HashSet};
+use std::fs as stdfs;
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use chrono::{DateTime, Utc};
+use containerd_shim::event::Event;
+use containerd_shim::protos::events::task::TaskOOM;
+use containerd_shim::protos::protobuf::MessageDyn;
+use containerd_shim::{Error, Result};
+use cube_hypervisor::config::RestoreConfig;
+use cube_hypervisor::vm_config::{DeviceConfig, FsConfig, IvshmemConfig};
+use cube_hypervisor::{SnapshotType, VmRemoveDeviceData};
+use oci_spec::runtime::{LinuxResources, Process, Spec};
+use protoc::{agent, agent_ttrpc, health, health_ttrpc};
+use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
+use ttrpc::context::{self, Context};
+use ttrpc::r#async::Client;
+
 use super::config::{Fs, ANNO_VMM_FS, VIRTIO_FS_ID, VIRTIO_FS_TAG};
+use super::device;
+use super::disk::Disk;
+use super::pmem::Pmem;
 use crate::common::types::PropagationMount;
 use crate::common::utils::{self, AsyncUtils, CPath, Utils};
 use crate::common::{
@@ -17,36 +43,12 @@ use crate::hypervisor::snapshot::{enable_snapshot, SnapshotInfo};
 use crate::log::{stat_defer, Log};
 use crate::sandbox::config;
 use crate::{debugf, errf, infof, warnf};
-use chrono::{DateTime, Utc};
-use containerd_shim::event::Event;
-use containerd_shim::protos::events::task::TaskOOM;
-use containerd_shim::protos::protobuf::MessageDyn;
-use containerd_shim::{Error, Result};
-use cube_hypervisor::config::RestoreConfig;
-use cube_hypervisor::vm_config::{DeviceConfig, FsConfig};
-use cube_hypervisor::{SnapshotType, VmRemoveDeviceData};
-use oci_spec::runtime::{LinuxResources, Process, Spec};
-use protoc::{agent, agent_ttrpc, health, health_ttrpc};
-use std::collections::{HashMap, HashSet};
-use std::fs as stdfs;
-use std::net::IpAddr;
-use std::time::Instant;
-use ttrpc::context::{self, Context};
-use ttrpc::r#async::Client;
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use tokio::sync::mpsc::{channel, Sender};
-use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
-
-use super::device;
-use super::disk::Disk;
-use super::pmem::Pmem;
 //use tokio_uring::fs::UnixStream;
 
 const ANNO_SANDBOX_DNS: &str = "cube.sandbox.dns";
+const ANNO_ENABLE_IVSHMEM: &str = "cube.master.enable_ivshmem";
+const IVSHMEM_DEFAULT_SIZE: usize = 1 * 1024 * 1024; // 1MB
 
 #[derive(PartialEq, Eq)]
 enum SandBoxState {
@@ -721,6 +723,12 @@ impl SandBox {
             .add_virtiofs(&self.conf.virtiofs)
             .add_vsock(self.id.clone());
 
+        // Enable ivshmem device when the template build path sets the internal annotation.
+        if self.is_ivshmem_enabled() {
+            Self::enable_default_ivshmem(&mut vc, &self.id)
+                .map_err(|e| format!("failed to enable ivshmem: {}", e))?;
+        }
+
         if let Some(fs) = self.conf.fs.as_ref() {
             vc.add_fs(fs);
         }
@@ -735,11 +743,12 @@ impl SandBox {
         }
         vc.add_cmdline("highres=off".to_string());
         vc.add_cmdline("clocksource=kvm-clock".to_string());
+        vc.add_cmdline("agent.unified_cgroup_hierarchy=true".to_string());
 
-        // 添加外部传入的 pmem
+        // Add externally passed pmem
         vc.add_pmems(&self.conf.pmem);
 
-        // 检查额外内核参数是否与已有参数冲突
+        // Check if extra kernel parameters conflict with existing ones
         if !self.conf.extra_kernel_params.is_empty() {
             let conflicts = vc.check_cmdline_conflicts(&self.conf.extra_kernel_params);
             if !conflicts.is_empty() {
@@ -759,6 +768,48 @@ impl SandBox {
 
     pub async fn recycle_resource(&mut self) -> CResult<()> {
         Ok(())
+    }
+
+    fn is_ivshmem_enabled(&self) -> bool {
+        self.spec
+            .annotations()
+            .as_ref()
+            .and_then(|anno| anno.get(ANNO_ENABLE_IVSHMEM))
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)
+    }
+
+    /// Enable the default ivshmem backend at `/dev/shm/ivshmem-{sandbox_id}`.
+    fn enable_default_ivshmem(vc: &mut VmConfig, sandbox_id: &str) -> CResult<()> {
+        let path = Utils::ivshmem_path(sandbox_id)?;
+        Utils::create_ivshmem_file(&path, IVSHMEM_DEFAULT_SIZE)?;
+        vc.enable_ivshmem(path, IVSHMEM_DEFAULT_SIZE);
+        Ok(())
+    }
+
+    /// Build restore-time ivshmem config with the default backend path.
+    fn default_ivshmem_config(sandbox_id: &str) -> CResult<IvshmemConfig> {
+        let path = Utils::ivshmem_path(sandbox_id)?;
+        Ok(IvshmemConfig {
+            path,
+            size: IVSHMEM_DEFAULT_SIZE,
+        })
+    }
+
+    /// Ensure the default ivshmem backend file exists before restore.
+    fn ensure_ivshmem_file(sandbox_id: &str) -> CResult<()> {
+        let path = Utils::ivshmem_path(sandbox_id)?;
+        match stdfs::metadata(&path) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Utils::create_ivshmem_file(&path, IVSHMEM_DEFAULT_SIZE)
+            }
+            Err(e) => Err(format!(
+                "failed to stat ivshmem file {}: {}",
+                path.display(),
+                e
+            )),
+        }
     }
 
     fn by_snapshot(&self) -> bool {
@@ -836,6 +887,13 @@ impl SandBox {
     }
 
     async fn restore_vm(&mut self) -> CResult<()> {
+        // Ensure the sandbox-specific ivshmem shm file exists when enabled by template annotation.
+        let enable_ivshmem = self.is_ivshmem_enabled();
+
+        if enable_ivshmem {
+            Self::ensure_ivshmem_file(&self.id)?;
+        }
+
         let ss_file = SnapshotInfo::load(
             self.conf.snapshot_base.as_str(),
             self.conf.vm_res.cpu,
@@ -882,6 +940,11 @@ impl SandBox {
             pmem: Some(pmems),
             vsock: Some(vsock),
             memory_vol_url: restore_memory_vol_url,
+            ivshmem: if enable_ivshmem {
+                Some(Self::default_ivshmem_config(&self.id)?)
+            } else {
+                None
+            },
             ..Default::default()
         };
 
@@ -957,6 +1020,16 @@ impl SandBox {
         }
 
         container.unwrap().signal_container(exec_id, sig).await
+    }
+
+    pub async fn close_io(&self, id: &String, exec_id: &String) -> Result<()> {
+        let mut containers = self.containers.lock().await;
+        let container = containers.get_mut(id);
+        if container.is_none() {
+            return Err(Error::NotFoundError(format!("not found container:{}", id)));
+        }
+
+        container.unwrap().close_io(exec_id).await
     }
 
     pub async fn delete_container(&mut self, id: &String) -> Result<(u32, DateTime<Utc>)> {
@@ -1325,7 +1398,7 @@ impl SandBox {
 
         let mut containers = self.containers.lock().await;
         for (_, c) in containers.iter_mut() {
-            c.set_client(client.clone()).await;
+            c.set_client(client.clone()).await?;
         }
 
         let (sender, handle) = self.watch_oom().await?;
@@ -1375,15 +1448,15 @@ fn normalize_dns_for_agent(entry: &str) -> CResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use protobuf::MessageDyn;
     use std::collections::HashSet;
-    use tokio::sync::mpsc::channel;
 
-    use crate::common::PRODUCT_CUBEBOX;
+    use protobuf::MessageDyn;
+    use tokio::sync::mpsc::channel;
 
     use super::normalize_dns_for_agent;
     use super::Log;
     use super::SandBox;
+    use crate::common::PRODUCT_CUBEBOX;
 
     #[tokio::test]
     async fn test_sandbox_prepare_resource() {
@@ -1411,10 +1484,14 @@ mod tests {
             .cmdlines
             .contains(&"another.param=foo".to_string()));
 
-        let mut set_expect: HashSet<String> = vec!["highres=off", "clocksource=kvm-clock"]
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mut set_expect: HashSet<String> = vec![
+            "highres=off",
+            "clocksource=kvm-clock",
+            "agent.unified_cgroup_hierarchy=true",
+        ]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
         let set_unexpect: HashSet<String> = vec!["clocksource=tsc", "tsc=reliable"]
             .into_iter()
             .map(|s| s.to_string())

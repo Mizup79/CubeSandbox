@@ -6,8 +6,12 @@ package cubebox
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
+	"io"
 	"log"
+	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -61,6 +65,182 @@ func newRedoContext(t *testing.T, args []string) *cli.Context {
 	ctx := cli.NewContext(nil, set, nil)
 	ctx.Command = TemplateRedoCommand
 	return ctx
+}
+
+func newCommitContext(t *testing.T, args []string) *cli.Context {
+	t.Helper()
+
+	set := flag.NewFlagSet("commit", flag.ContinueOnError)
+	set.String("address", "", "cubemaster address")
+	set.String("port", "", "cubemaster port")
+	set.Duration("timeout", 0, "request timeout")
+	for _, cliFlag := range TemplateCommitCommand.Flags {
+		cliFlag.Apply(set)
+	}
+	if err := set.Parse(args); err != nil {
+		t.Fatalf("parse args %v: %v", args, err)
+	}
+
+	ctx := cli.NewContext(nil, set, nil)
+	ctx.Command = TemplateCommitCommand
+	return ctx
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func TestCommitCommandLetsCubeMasterResolveRequest(t *testing.T) {
+	var requests []string
+	var commitBody map[string]interface{}
+	origHTTPClient := http.DefaultClient
+	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests = append(requests, req.URL.Path)
+		if req.URL.Path != "/cube/sandbox/commit" {
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader("unexpected endpoint")),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		}
+		if err := json.NewDecoder(req.Body).Decode(&commitBody); err != nil {
+			t.Fatalf("decode commit body: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"ret":{"ret_code":200,"ret_msg":"success"},"template_id":"tpl-new"}`)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})}
+	defer func() {
+		http.DefaultClient = origHTTPClient
+	}()
+
+	ctx := newCommitContext(t, []string{
+		"--address", "127.0.0.1",
+		"--port", "8089",
+		"--sandbox-id", "sb-auto",
+		"--detach",
+	})
+	action, ok := TemplateCommitCommand.Action.(func(*cli.Context) error)
+	if !ok {
+		t.Fatalf("unexpected commit action type %T", TemplateCommitCommand.Action)
+	}
+	if err := action(ctx); err != nil {
+		t.Fatalf("commit action returned error: %v", err)
+	}
+	if got, want := strings.Join(requests, ","), "/cube/sandbox/commit"; got != want {
+		t.Fatalf("request paths=%q, want %q", got, want)
+	}
+	if _, ok := commitBody["create_request"]; ok {
+		t.Fatalf("create_request should be omitted: %v", commitBody["create_request"])
+	}
+}
+
+func TestCommitCommandRequiresFileForNetworkOverrides(t *testing.T) {
+	ctx := newCommitContext(t, []string{
+		"--address", "127.0.0.1",
+		"--port", "8089",
+		"--sandbox-id", "sb-auto",
+		"--allow-internet-access=false",
+		"--detach",
+	})
+	action := TemplateCommitCommand.Action.(func(*cli.Context) error)
+	err := action(ctx)
+	if err == nil || !strings.Contains(err.Error(), "network override flags require --file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCommitCommandUsesFileAsCompleteRequestWithNetworkOverrides(t *testing.T) {
+	path := t.TempDir() + "/request.json"
+	if err := os.WriteFile(path, []byte(`{
+		"instance_type":"cubebox",
+		"network_type":"tap",
+		"cube_network_config":{"allowInternetAccess":true,"allowOut":["10.0.0.0/8"]}
+	}`), 0600); err != nil {
+		t.Fatalf("write request file: %v", err)
+	}
+	var requests []string
+	var commitBody struct {
+		CreateRequest struct {
+			InstanceType      string `json:"instance_type"`
+			NetworkType       string `json:"network_type"`
+			CubeNetworkConfig struct {
+				AllowInternetAccess *bool    `json:"allowInternetAccess"`
+				AllowOut            []string `json:"allowOut"`
+				DenyOut             []string `json:"denyOut"`
+			} `json:"cube_network_config"`
+		} `json:"create_request"`
+	}
+	origHTTPClient := http.DefaultClient
+	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests = append(requests, req.URL.Path)
+		if req.URL.Path != "/cube/sandbox/commit" {
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader("unexpected endpoint")),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		}
+		if err := json.NewDecoder(req.Body).Decode(&commitBody); err != nil {
+			t.Fatalf("decode commit body: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"ret":{"ret_code":200,"ret_msg":"success"},"template_id":"tpl-new"}`)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})}
+	defer func() {
+		http.DefaultClient = origHTTPClient
+	}()
+
+	ctx := newCommitContext(t, []string{
+		"--address", "127.0.0.1",
+		"--port", "8089",
+		"--sandbox-id", "sb-file",
+		"--file", path,
+		"--allow-internet-access=false",
+		"--allow-out-cidr", "172.67.0.0/16",
+		"--deny-out-cidr", "192.168.0.0/16",
+		"--detach",
+	})
+	action, ok := TemplateCommitCommand.Action.(func(*cli.Context) error)
+	if !ok {
+		t.Fatalf("unexpected commit action type %T", TemplateCommitCommand.Action)
+	}
+	if err := action(ctx); err != nil {
+		t.Fatalf("commit action returned error: %v", err)
+	}
+	if got, want := strings.Join(requests, ","), "/cube/sandbox/commit"; got != want {
+		t.Fatalf("request paths=%q, want %q", got, want)
+	}
+	createRequest := commitBody.CreateRequest
+	if got := createRequest.InstanceType; got != "cubebox" {
+		t.Fatalf("instance_type=%v", got)
+	}
+	if got := createRequest.NetworkType; got != "tap" {
+		t.Fatalf("network_type=%v", got)
+	}
+	if createRequest.CubeNetworkConfig.AllowInternetAccess == nil {
+		t.Fatalf("cube_network_config=%+v", createRequest.CubeNetworkConfig)
+	}
+	if got := *createRequest.CubeNetworkConfig.AllowInternetAccess; got {
+		t.Fatalf("allowInternetAccess=%v, want false", got)
+	}
+	if got, want := strings.Join(createRequest.CubeNetworkConfig.AllowOut, ","), "10.0.0.0/8,172.67.0.0/16"; got != want {
+		t.Fatalf("allowOut=%q, want %q", got, want)
+	}
+	if got, want := strings.Join(createRequest.CubeNetworkConfig.DenyOut, ","), "192.168.0.0/16"; got != want {
+		t.Fatalf("denyOut=%q, want %q", got, want)
+	}
 }
 
 func TestCreateCommandParsesNodeScope(t *testing.T) {
@@ -120,6 +300,20 @@ func TestCreateFromImageCommandParsesNodeScope(t *testing.T) {
 	})
 	if got := ctx.StringSlice("node"); len(got) != 2 || got[0] != "node-a" || got[1] != "10.0.0.2" {
 		t.Fatalf("node flags=%v", got)
+	}
+}
+
+func TestApplyCreateFromImageIvshmemFlag(t *testing.T) {
+	withoutFlag := &types.CreateTemplateFromImageReq{}
+	applyCreateFromImageIvshmemFlag(newCreateFromImageContext(t, nil), withoutFlag)
+	if withoutFlag.EnableIvshmem != nil {
+		t.Fatalf("EnableIvshmem=%v, want nil when flag is not set", *withoutFlag.EnableIvshmem)
+	}
+
+	withFlag := &types.CreateTemplateFromImageReq{}
+	applyCreateFromImageIvshmemFlag(newCreateFromImageContext(t, []string{"--enable-ivshmem"}), withFlag)
+	if withFlag.EnableIvshmem == nil || !*withFlag.EnableIvshmem {
+		t.Fatalf("EnableIvshmem=%v, want true", withFlag.EnableIvshmem)
 	}
 }
 
@@ -420,7 +614,7 @@ func TestPrintTemplateSummaryIncludesOptionalMetadata(t *testing.T) {
 	logOutput := logBuf.String()
 	for _, want := range []string{
 		"template_id: tpl-1",
-		"display_name: python-template",
+		"alias: python-template",
 		"created_at: 2026-06-17 12:00:00",
 		"image_info: docker.io/library/python:3.12",
 	} {
@@ -430,5 +624,104 @@ func TestPrintTemplateSummaryIncludesOptionalMetadata(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "NODE_ID") {
 		t.Fatalf("stdout=%q, missing replica table header", stdout)
+	}
+}
+
+func TestResolveTemplateIDFromFlag(t *testing.T) {
+	ctx := newRedoContext(t, []string{"--template-id", "tpl-1"})
+	if got := resolveTemplateID(ctx); got != "tpl-1" {
+		t.Fatalf("got %q, want tpl-1", got)
+	}
+}
+
+func TestResolveTemplateIDFromPositional(t *testing.T) {
+	ctx := newRedoContext(t, []string{"tpl-1"})
+	if got := resolveTemplateID(ctx); got != "tpl-1" {
+		t.Fatalf("got %q, want tpl-1", got)
+	}
+}
+
+func TestResolveTemplateIDFlagOverridesPositional(t *testing.T) {
+	ctx := newRedoContext(t, []string{"--template-id", "flag-id", "positional-id"})
+	if got := resolveTemplateID(ctx); got != "flag-id" {
+		t.Fatalf("got %q, want flag-id", got)
+	}
+}
+
+func TestResolveTemplateIDEmpty(t *testing.T) {
+	ctx := newRedoContext(t, nil)
+	if got := resolveTemplateID(ctx); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+}
+
+// newCmdContext builds a *cli.Context from a command definition and args,
+// used to verify resolveTemplateID works correctly with each command's
+// specific flag set (info, delete, redo).
+func newCmdContext(t *testing.T, cmd cli.Command, args []string) *cli.Context {
+	t.Helper()
+	set := flag.NewFlagSet(cmd.Name, flag.ContinueOnError)
+	for _, cliFlag := range cmd.Flags {
+		cliFlag.Apply(set)
+	}
+	if err := set.Parse(args); err != nil {
+		t.Fatalf("parse args %v: %v", args, err)
+	}
+	ctx := cli.NewContext(nil, set, nil)
+	ctx.Command = cmd
+	return ctx
+}
+
+func TestResolveTemplateIDFromAllTemplateCommands(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  cli.Command
+		args []string
+		want string
+	}{
+		{
+			name: "info via positional arg",
+			cmd:  TemplateInfoCommand,
+			args: []string{"tpl-info-1"},
+			want: "tpl-info-1",
+		},
+		{
+			name: "delete via positional arg",
+			cmd:  TemplateDeleteCommand,
+			args: []string{"tpl-delete-1"},
+			want: "tpl-delete-1",
+		},
+		{
+			name: "redo via positional arg",
+			cmd:  TemplateRedoCommand,
+			args: []string{"tpl-redo-1"},
+			want: "tpl-redo-1",
+		},
+		{
+			name: "info flag overrides positional",
+			cmd:  TemplateInfoCommand,
+			args: []string{"--template-id", "flag-id", "positional-id"},
+			want: "flag-id",
+		},
+		{
+			name: "delete flag overrides positional",
+			cmd:  TemplateDeleteCommand,
+			args: []string{"--template-id", "flag-id", "positional-id"},
+			want: "flag-id",
+		},
+		{
+			name: "redo flag overrides positional",
+			cmd:  TemplateRedoCommand,
+			args: []string{"--template-id", "flag-id", "positional-id"},
+			want: "flag-id",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newCmdContext(t, tt.cmd, tt.args)
+			if got := resolveTemplateID(ctx); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

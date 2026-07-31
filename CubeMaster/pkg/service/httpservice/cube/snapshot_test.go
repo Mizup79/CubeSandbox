@@ -11,16 +11,21 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/common"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
 	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
 )
 
 func TestCreateSnapshotSuccessResponse(t *testing.T) {
+	registerKnownSandboxTestID(t)
+
 	origCreateSnapshotFn := createSnapshotFn
 	origGetSnapshotInfoFn := getSnapshotInfoFn
 	origResolveSnapshotHostFn := resolveSnapshotHostFn
@@ -55,14 +60,14 @@ func TestCreateSnapshotSuccessResponse(t *testing.T) {
 		return &templatecenter.SnapshotInfo{
 			SnapshotID:      snapshotID,
 			Status:          "READY",
-			OriginSandboxID: "sb-1",
+			OriginSandboxID: knownSandboxTestID,
 			StorageBackend:  "cubecow",
 		}, nil
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/cube/snapshot", strings.NewReader(`{
 		"requestID":"req-1",
-		"sandbox_id":"sb-1",
+		"sandbox_id":"`+knownSandboxTestID+`",
 		"display_name":"snap-name"
 	}`))
 	rt := &CubeLog.RequestTrace{}
@@ -75,7 +80,7 @@ func TestCreateSnapshotSuccessResponse(t *testing.T) {
 	assert.Equal(t, int(errorcode.ErrorCode_Success), got.Ret.RetCode)
 	if assert.NotNil(t, got.Snapshot) {
 		assert.Equal(t, "snap-1", got.Snapshot.SnapshotID)
-		assert.Equal(t, "sb-1", got.Snapshot.OriginSandboxID)
+		assert.Equal(t, knownSandboxTestID, got.Snapshot.OriginSandboxID)
 	}
 	if assert.NotNil(t, got.Operation) {
 		assert.Equal(t, "op-1", got.Operation.OperationID)
@@ -95,6 +100,8 @@ func TestSnapshotErrorCodeMapsMySQLLockErrorsToDBError(t *testing.T) {
 }
 
 func TestCreateSnapshotAcceptsSnakeCaseRequestID(t *testing.T) {
+	registerKnownSandboxTestID(t)
+
 	origCreateSnapshotFn := createSnapshotFn
 	origGetSnapshotInfoFn := getSnapshotInfoFn
 	origResolveSnapshotHostFn := resolveSnapshotHostFn
@@ -116,7 +123,7 @@ func TestCreateSnapshotAcceptsSnakeCaseRequestID(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/cube/snapshot", strings.NewReader(`{
 		"request_id":"req-snake",
-		"sandbox_id":"sb-1"
+		"sandbox_id":"`+knownSandboxTestID+`"
 	}`))
 	rt := &CubeLog.RequestTrace{}
 	resp := createSnapshot(req, rt)
@@ -128,6 +135,8 @@ func TestCreateSnapshotAcceptsSnakeCaseRequestID(t *testing.T) {
 }
 
 func TestCreateSnapshotDetachesExecutionFromCanceledRequest(t *testing.T) {
+	registerKnownSandboxTestID(t)
+
 	origCreateSnapshotFn := createSnapshotFn
 	origGetSnapshotInfoFn := getSnapshotInfoFn
 	origResolveSnapshotHostFn := resolveSnapshotHostFn
@@ -169,7 +178,7 @@ func TestCreateSnapshotDetachesExecutionFromCanceledRequest(t *testing.T) {
 
 	baseReq := httptest.NewRequest(http.MethodPost, "/cube/snapshot", strings.NewReader(`{
 		"request_id":"req-detached",
-		"sandbox_id":"sb-1"
+		"sandbox_id":"`+knownSandboxTestID+`"
 	}`))
 	canceledCtx, cancel := context.WithCancel(baseReq.Context())
 	cancel()
@@ -204,14 +213,16 @@ func TestHandleSnapshotOperationMapsNotFound(t *testing.T) {
 		return nil, templatecenter.ErrSnapshotOperationNotFound
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/cube/operation/op-missing", nil)
 	rt := &CubeLog.RequestTrace{}
-	resp := handleSnapshotOperationAction(httptest.NewRecorder(), req, rt)
+	ctx := CubeLog.WithRequestTrace(context.Background(), rt)
+	w := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(w)
+	gc.Request = httptest.NewRequest(http.MethodGet, "/cube/operation/op-missing", nil).WithContext(ctx)
+	gc.Params = gin.Params{{Key: "operation_id", Value: "op-missing"}}
+	handleSnapshotOperationAction(gc)
 
-	got, ok := resp.(*operationResponse)
-	if !ok {
-		t.Fatalf("unexpected response type %T", resp)
-	}
+	var got operationResponse
+	require.NoError(t, common.FastestJsoniter.Unmarshal(w.Body.Bytes(), &got))
 	assert.Equal(t, int(errorcode.ErrorCode_NotFound), got.Ret.RetCode)
 	assert.Equal(t, int64(errorcode.ErrorCode_NotFound), rt.RetCode)
 }
@@ -232,7 +243,7 @@ func TestGetSnapshotListSupportsFiltersAndPagination(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/cube/snapshot?snapshot_id=snap-1&sandbox_id=sb-1&status=READY&limit=1&next_token=1&request_id=req-list", nil)
 	rt := &CubeLog.RequestTrace{}
-	resp := getSnapshot(req, rt)
+	resp := getSnapshot(req, rt, "")
 
 	got := resp.(*snapshotListResponse)
 	assert.Equal(t, int(errorcode.ErrorCode_Success), got.Ret.RetCode)
@@ -244,13 +255,15 @@ func TestGetSnapshotListSupportsFiltersAndPagination(t *testing.T) {
 }
 
 func TestHandleSandboxRollbackActionUsesPathSandboxID(t *testing.T) {
+	registerKnownSandboxTestID(t)
+
 	origRollbackSnapshotFn := rollbackSnapshotFn
 	t.Cleanup(func() {
 		rollbackSnapshotFn = origRollbackSnapshotFn
 	})
 	rollbackSnapshotFn = func(ctx context.Context, requestID, sandboxID, snapshotID, instanceType string) (*types.TemplateImageJobInfo, error) {
 		assert.Equal(t, "req-rb", requestID)
-		assert.Equal(t, "sb-path", sandboxID)
+		assert.Equal(t, knownSandboxTestID, sandboxID)
 		assert.Equal(t, "snap-1", snapshotID)
 		return &types.TemplateImageJobInfo{
 			JobID:      "op-rb",
@@ -261,14 +274,20 @@ func TestHandleSandboxRollbackActionUsesPathSandboxID(t *testing.T) {
 		}, nil
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/cube/sandbox/sb-path/rollback", strings.NewReader(`{
+	req := httptest.NewRequest(http.MethodPost, "/cube/sandbox/"+knownSandboxTestID+"/rollback", strings.NewReader(`{
 		"request_id":"req-rb",
 		"snapshot_id":"snap-1"
 	}`))
 	rt := &CubeLog.RequestTrace{}
-	resp := handleSandboxRollbackAction(httptest.NewRecorder(), req, rt)
+	ctx := CubeLog.WithRequestTrace(context.Background(), rt)
+	w := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(w)
+	gc.Request = req.WithContext(ctx)
+	gc.Params = gin.Params{{Key: "sandbox_id", Value: knownSandboxTestID}}
+	handleSandboxRollbackAction(gc)
 
-	got := resp.(*operationResponse)
+	var got operationResponse
+	require.NoError(t, common.FastestJsoniter.Unmarshal(w.Body.Bytes(), &got))
 	assert.Equal(t, int(errorcode.ErrorCode_Success), got.Ret.RetCode)
 	assert.Equal(t, "req-rb", got.RequestID)
 	assert.Equal(t, "op-rb", got.Operation.OperationID)
